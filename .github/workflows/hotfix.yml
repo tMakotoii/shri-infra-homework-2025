@@ -1,0 +1,61 @@
+name: Hotfix Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия релиза для фикса (например: 1)"
+        required: true
+        type: string
+
+jobs:
+  hotfix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "releases/${{ inputs.version }}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Lint code
+        run: npm run lint
+
+      - name: Build Docker image
+        run: docker build -t app .
+
+      - name: Login to Yandex Container Registry
+        run: |
+          echo "${{ secrets.YC_TOKEN }}" | docker login \
+          --username iam \
+          --password-stdin \
+          cr.yandex
+
+      - name: Tag and push images
+        run: |
+          docker tag app cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_fix${{ github.run_number }}
+          docker tag app cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+          docker push cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_fix${{ github.run_number }}
+          docker push cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+
+      - name: Create fix tag
+        run: |
+          git tag v${{ inputs.version }}-fix${{ github.run_number }}
+          git push origin v${{ inputs.version }}-fix${{ github.run_number }}
+
+      - name: Add comment to Release Issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment $ISSUE_NUMBER --body "✅ Фикс ${{ github.run_number }} выпущен:
+          - Версия: ${{ inputs.version }}_fix${{ github.run_number }}
+          - Дата: $(date)
+          - Автор: ${{ github.actor }}
+          - Образ: cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_fix${{ github.run_number }}"
