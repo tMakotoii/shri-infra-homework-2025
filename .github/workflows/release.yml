@@ -27,7 +27,7 @@ jobs:
 
       - name: Build and push Docker image
         env:
-          REGISTRY_ID: your-registry-id
+          REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
           YC_TOKEN: ${{ secrets.YC_TOKEN }}
         run: |
           # Build and push to Yandex Container Registry
