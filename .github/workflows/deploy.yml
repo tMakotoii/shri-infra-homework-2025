@@ -57,8 +57,15 @@ jobs:
             curl -I http://localhost:3000/hw/store || true
 
       - name: Verify deployment
-        run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "
-            docker inspect app --format '{{ .State.Status }}' | grep -q running
-            curl -s http://localhost:3000/hw/store | grep -q 'React App'
-          "
+          run: |
+            ssh -i ~/.ssh/id_ed25519 ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} /bin/bash << 'EOF'
+            set -e 
+            echo "Checking container status..."
+            container_status=$(docker inspect -f '{{.State.Status}}' app)
+            [ "$container_status" = "running" ] || exit 1
+            echo "Container status: $container_status"
+            
+            echo "Testing application..."
+            curl -sSf http://localhost:3000/hw/store > /dev/null
+            echo "Application is responding!"
+            EOF
