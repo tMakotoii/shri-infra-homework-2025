@@ -3,95 +3,67 @@ name: Deploy to Production
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to deploy (e.g. 1 or 1_fix1)"
+      release_version:
+        description: "Release version (e.g., 5)"
         required: true
-        type: string
 
 env:
-  REGISTRY: cr.yandex/${{ secrets.REGISTRY_ID }}
-  IMAGE: cr.yandex/${{ secrets.REGISTRY_ID }}/app
+  IMAGE: cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Install GitHub CLI
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          sudo apt-get update
-          sudo apt-get install -y gh
+      - name: Login to Yandex Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: cr.yandex
+          username: json_key
+          password: ${{ secrets.YC_SA_KEY }}
 
-      - name: Configure SSH
+      - name: Check if image exists
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          echo "Host *" > ~/.ssh/config
-          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
-          chmod 600 ~/.ssh/config
+          IMAGE_TAG="${{ github.event.inputs.release_version }}_latest"
+          echo "Checking image: $IMAGE:$IMAGE_TAG"
+          docker manifest inspect $IMAGE:$IMAGE_TAG > /dev/null; 
 
-      - name: Verify image exists
-        run: |
-          if ! docker manifest inspect $IMAGE:${{ inputs.version }}_latest >/dev/null 2>&1; then
-            echo "::error::Image $IMAGE:${{ inputs.version }}_latest not found in registry"
+          if [ $? -ne 0 ]; then
+            echo "❌ Image with tag $IMAGE_TAG not found in registry"
             exit 1
           fi
-          echo "Image verified successfully"
 
-      - name: Deploy to VM
-        uses: appleboy/ssh-action@v1
+      - name: Deploy to Production VM over SSH
+        uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ secrets.VM_IP }}
-          username: ${{ secrets.VM_USERNAME }}
-          key: ${{ secrets.SSH_KEY }}
-          script_timeout: 10m
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
           script: |
-            set -exo pipefail
+            IMAGE="cr.yandex/${{ secrets.YC_REGISTRY_ID }}/app"
+            docker login --username json_key --password '${{ secrets.YC_SA_KEY }}' cr.yandex
+            docker pull $IMAGE:${{ github.event.inputs.release_version }}_latest
+            docker stop app || true
+            docker rm app || true
+            docker run -d --name app -p 80:3000 $IMAGE:${{ github.event.inputs.release_version }}_latest
 
-            # Auth and pull
-            echo "${{ secrets.YC_TOKEN }}" | docker login --username iam --password-stdin cr.yandex
-            docker pull $IMAGE:${{ inputs.version }}_latest
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-            # Stop old container if exists
-            if docker inspect app >/dev/null 2>&1; then
-              docker stop app || true
-              docker rm app || true
-            fi
-
-            # Run new container
-            docker run -d \
-              --name app \
-              --restart unless-stopped \
-              -p 80:3000 \
-              -e NODE_ENV=production \
-              $IMAGE:${{ inputs.version }}_latest
-
-            # Verify
-            sleep 15  # Wait for app to start
-            docker ps --filter name=app
-            curl -I http://localhost:3000
-
-      - name: Find release issue
+      - name: Find related release issue
         id: find_issue
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GIT_ISSUE_TOKEN }}
         run: |
-          ISSUE_NUMBER=$(gh issue list --search "Release ${{ inputs.version }}" --json number --jq '.[0].number')
-          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          ISSUE=$(gh issue list --state open --limit 100 --json number,title | jq -r --arg TITLE "Release ${{ github.event.inputs.release_version }}" '.[] | select(.title == $TITLE) | .number' | head -n1)
+          echo "issue_number=$ISSUE" >> $GITHUB_OUTPUT
 
-      - name: Add deployment comment
+      - name: Add comment to release issue
         if: steps.find_issue.outputs.issue_number != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GIT_ISSUE_TOKEN }}
         run: |
-          gh issue comment ${{ steps.find_issue.outputs.issue_number }} --body "
-          ### ✅ Successfully deployed to production
-          **Version:** ${{ inputs.version }}
-          **Deployed by:** ${{ github.actor }}
-          **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-          **Image:** $IMAGE:${{ inputs.version }}_latest
-          "
+          echo "**✅ Deployed to Production**" > comment.txt
+          echo "**Date:** $(date -u)" >> comment.txt
+          echo "**By:** ${{ github.actor }}" >> comment.txt
+          gh issue comment ${{ steps.find_issue.outputs.issue_number }} --body-file comment.txt
