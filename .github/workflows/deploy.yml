@@ -1,25 +1,64 @@
-name: Deploy
+name: Deploy to Yandex Cloud VM
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version"
+        description: "Version to deploy (e.g. 1 or 1_fix1)"
         required: true
+        type: string
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: SSH and deploy
-        uses: appleboy/ssh-action@master
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "Host *" > ~/.ssh/config
+          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+      - name: Test SSH connection
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -v ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "echo 'SSH connection successful!'"
+
+      - name: Deploy application
+        uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VM_IP }}
           username: ${{ secrets.VM_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
+          script_timeout: 2m
           script: |
+            # Docker auth and pull
+            echo "${{ secrets.YC_TOKEN }}" | docker login --username iam --password-stdin cr.yandex
+            docker pull cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+
+            # Stop old container
             docker stop app || true
             docker rm app || true
-            echo ${{ secrets.YC_TOKEN }} | docker login --username iam --password-stdin cr.yandex
-            docker pull cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ github.event.inputs.version }}_latest
-            docker run -d -p 80:3000 --name app cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ github.event.inputs.version }}_latest
+
+            # Run new container
+            docker run -d \
+              --name app \
+              --restart always \
+              -p 80:3000 \
+              -e NODE_ENV=production \
+              cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+
+            # Verify
+            docker ps
+            curl -I http://localhost:3000/hw/store || true
+
+      - name: Verify deployment
+        run: |
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "
+            docker inspect app --format '{{ .State.Status }}' | grep -q running
+            curl -s http://localhost:3000/hw/store | grep -q 'React App'
+          "
