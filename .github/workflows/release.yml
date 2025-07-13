@@ -6,15 +6,26 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      REGISTRY: cr.yandex/${{ secrets.REGISTRY_ID }}
+      IMAGE: cr.yandex/${{ secrets.REGISTRY_ID }}/app
+      VERSION: ${{ github.run_number }}
+
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-node@v2
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: "16"
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Run checks
         run: |
-          npm ci
           npm run lint
           npm run test
 
@@ -22,27 +33,79 @@ jobs:
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
-          git checkout -b releases/${{ github.run_number }}
-          git push origin releases/${{ github.run_number }}
+          git checkout -b releases/$VERSION
+          git push origin releases/$VERSION
 
-      - name: Build and push Docker image
+      - name: Build Docker image
+        run: |
+          docker build -t $IMAGE:$VERSION .
+          docker tag $IMAGE:$VERSION $IMAGE:${VERSION}_latest
+
+      - name: Login to Yandex Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: cr.yandex
+          username: iam
+          password: ${{ secrets.YC_TOKEN }}
+
+      - name: Push Docker images
+        run: |
+          docker push $IMAGE:$VERSION
+          docker push $IMAGE:${VERSION}_latest
+
+      - name: Create git tag
+        run: |
+          git tag v$VERSION
+          git push origin v$VERSION
+
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s")
+          else
+            COMMITS=$(git log $LAST_TAG..HEAD --pretty=format:"- %s")
+          fi
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update CHANGELOG.md
+        run: |
+          echo "# Version $VERSION - $(date +'%Y-%m-%d')" > NEW_CHANGELOG.md
+          echo "${{ steps.changelog.outputs.commits }}" >> NEW_CHANGELOG.md
+          echo "" >> NEW_CHANGELOG.md
+          cat CHANGELOG.md >> NEW_CHANGELOG.md
+          mv NEW_CHANGELOG.md CHANGELOG.md
+          
+          git add CHANGELOG.md
+          git commit -m "Update CHANGELOG for version $VERSION"
+          git push origin releases/$VERSION
+
+      - name: Create release issue
         env:
-          REGISTRY_ID: ${{ secrets.REGISTRY_ID }}
-          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Build and push to Yandex Container Registry
-          docker build -t cr.yandex/$REGISTRY_ID/app:${{ github.run_number }} .
-          docker tag cr.yandex/$REGISTRY_ID/app:${{ github.run_number }} cr.yandex/$REGISTRY_ID/app:${{ github.run_number }}_latest
-          echo $YC_TOKEN | docker login --username iam --password-stdin cr.yandex
-          docker push cr.yandex/$REGISTRY_ID/app:${{ github.run_number }}
-          docker push cr.yandex/$REGISTRY_ID/app:${{ github.run_number }}_latest
+          gh issue create \
+            --title "Release $VERSION" \
+            --body "### Release Information
+**Version:** $VERSION  
+**Author:** ${{ github.actor }}  
+**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')  
+**Docker Image:** $IMAGE:$VERSION  
 
-      - name: Create tag
-        run: |
-          git tag v${{ github.run_number }}
-          git push origin v${{ github.run_number }}
+### Changes
+${{ steps.changelog.outputs.commits }}
 
-      - name: Update CHANGELOG and create Issue
-        run: |
-          # Add commands to update CHANGELOG.md
-          # Create GitHub issue using gh CLI
+### Deployment
+To deploy this version run the [Deploy workflow](https://github.com/${{ github.repository }}/actions/workflows/deploy.yml) with version: $VERSION"
