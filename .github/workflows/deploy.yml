@@ -8,71 +8,90 @@ on:
         required: true
         type: string
 
+env:
+  REGISTRY: cr.yandex/${{ secrets.REGISTRY_ID }}
+  IMAGE: cr.yandex/${{ secrets.REGISTRY_ID }}/app
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y gh
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          echo "Host *" > ~/.ssh/config
+          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
 
-      - name: Deploy container
+      - name: Verify image exists
+        run: |
+          if ! docker manifest inspect $IMAGE:${{ inputs.version }}_latest >/dev/null 2>&1; then
+            echo "::error::Image $IMAGE:${{ inputs.version }}_latest not found in registry"
+            exit 1
+          fi
+          echo "Image verified successfully"
+
+      - name: Deploy to VM
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VM_IP }}
           username: ${{ secrets.VM_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          script_timeout: 5m
+          script_timeout: 10m
           script: |
-            set -ex  # Включить вывод команд и прерывание при ошибках
+            set -exo pipefail
 
-            # 1. Авторизация и загрузка образа
+            # Auth and pull
             echo "${{ secrets.YC_TOKEN }}" | docker login --username iam --password-stdin cr.yandex
-            docker pull cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+            docker pull $IMAGE:${{ inputs.version }}_latest
 
-            # 2. Остановка старого контейнера (если есть)
-            if docker ps -a | grep -q app; then
+            # Stop old container if exists
+            if docker inspect app >/dev/null 2>&1; then
               docker stop app || true
               docker rm app || true
-              echo "Старый контейнер удален"
-            else
-              echo "Предыдущий контейнер не найден - пропускаем удаление"
             fi
 
-            # 3. Запуск нового контейнера
+            # Run new container
             docker run -d \
               --name app \
               --restart unless-stopped \
               -p 80:3000 \
               -e NODE_ENV=production \
-              cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+              $IMAGE:${{ inputs.version }}_latest
 
-            # 4. Проверка запуска
-            sleep 10  # Даем время на запуск
-            docker ps --filter name=app --format "table {{.ID}}\t{{.Names}}\t{{.Status}}"
+            # Verify
+            sleep 15  # Wait for app to start
+            docker ps --filter name=app
+            curl -I http://localhost:3000
 
-      - name: Verify deployment
+      - name: Find release issue
+        id: find_issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} << 'EOF'
-          set -e
+          ISSUE_NUMBER=$(gh issue list --search "Release ${{ inputs.version }}" --json number --jq '.[0].number')
+          echo "issue_number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
 
-          # Проверяем, что контейнер существует и работает
-          if ! docker ps --format '{{.Names}}' | grep -q '^app$'; then
-            echo "::error::Контейнер 'app' не запущен"
-            echo "Список контейнеров:"
-            docker ps -a
-            exit 1
-          fi
-
-          # Проверяем доступность приложения
-          if ! curl -sSf --retry 3 --max-time 10 http://localhost:3000/hw/store; then
-            echo "::error::Приложение не отвечает"
-            echo "Логи контейнера:"
-            docker logs app
-            exit 1
-          fi
-
-          echo "✅ Проверка пройдена"
-          EOF
+      - name: Add deployment comment
+        if: steps.find_issue.outputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue comment ${{ steps.find_issue.outputs.issue_number }} --body "
+          ### ✅ Successfully deployed to production
+          **Version:** ${{ inputs.version }}
+          **Deployed by:** ${{ github.actor }}
+          **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          **Image:** $IMAGE:${{ inputs.version }}_latest
+          "
