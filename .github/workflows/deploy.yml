@@ -1,71 +1,85 @@
-name: Deploy to Yandex Cloud VM
+name: Deploy to Production
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to deploy (e.g. 1 or 1_fix1)"
+        description: "Release version (e.g., 1 or 1_fix1)"
         required: true
         type: string
+
+env:
+  IMAGE: cr.yandex/${{ secrets.REGISTRY_ID }}/app
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Login to YCR
+        uses: docker/login-action@v3
+        with:
+          registry: cr.yandex
+          username: iam
+          password: ${{ secrets.YC_TOKEN }}
 
-      - name: Configure SSH
+      - name: Verify image exists
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          echo "Host *" > ~/.ssh/config
-          echo "  StrictHostKeyChecking no" >> ~/.ssh/config
-          chmod 600 ~/.ssh/config
+          IMAGE_TAG="${{ inputs.version }}_latest"
+          if ! docker manifest inspect $IMAGE:$IMAGE_TAG >/dev/null 2>&1; then
+            echo "::error::Image $IMAGE:$IMAGE_TAG not found in registry"
+            exit 1
+          fi
+          echo "Image $IMAGE:$IMAGE_TAG verified"
 
-      - name: Test SSH connection
-        run: |
-          ssh -i ~/.ssh/id_ed25519 -v ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} "echo 'SSH connection successful!'"
-
-      - name: Deploy application
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VM_IP }}
           username: ${{ secrets.VM_USERNAME }}
           key: ${{ secrets.SSH_KEY }}
-          script_timeout: 2m
+          script_timeout: 5m
           script: |
-            # Docker auth and pull
+            set -e  # Прерывать при ошибках
+            echo "=== Starting deployment ==="
+
+            # Авторизация и загрузка образа
             echo "${{ secrets.YC_TOKEN }}" | docker login --username iam --password-stdin cr.yandex
-            docker pull cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+            docker pull $IMAGE:${{ inputs.version }}_latest
 
-            # Stop old container
-            docker stop app || true
-            docker rm app || true
+            # Остановка старого контейнера
+            docker stop app || echo "No running container to stop"
+            docker rm app || echo "No container to remove"
 
-            # Run new container
+            # Запуск нового контейнера
             docker run -d \
               --name app \
-              --restart always \
+              --restart unless-stopped \
               -p 80:3000 \
               -e NODE_ENV=production \
-              cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
+              $IMAGE:${{ inputs.version }}_latest
 
-            # Verify
-            docker ps
-            curl -I http://localhost:3000/hw/store || true
+            echo "=== Deployment complete ==="
+            docker ps --filter name=app
 
       - name: Verify deployment
         run: |
-          ssh -i ~/.ssh/id_ed25519 ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} /bin/bash << 'EOF'
-          set -e  # Прерывать при ошибках
-          echo "Checking container status..."
-          container_status=$(docker inspect -f '{{.State.Status}}' app)
-          [ "$container_status" = "running" ] || exit 1
-          echo "Container status: $container_status"
+          ssh -i ~/.ssh/id_ed25519 ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} << 'EOF'
+          set -e
+          echo "=== Verification ==="
 
-          echo "Testing application..."
-          curl -sSf http://localhost:3000/hw/store > /dev/null
-          echo "Application is responding!"
+          # Проверка контейнера
+          if ! docker inspect -f '{{.State.Running}}' app | grep -q true; then
+            echo "::error::Container is not running"
+            docker logs app || true
+            exit 1
+          fi
+
+          # Проверка приложения
+          if ! curl -sSf --retry 3 --max-time 10 http://localhost:3000/hw/store >/dev/null; then
+            echo "::error::Application not responding"
+            docker exec app netstat -tuln || true
+            exit 1
+          fi
+
+          echo "✅ Verification passed"
           EOF
