@@ -1,6 +1,6 @@
 import React from "react";
-import { Helmet } from "react-helmet";
 import { cn } from "@bem-react/classname";
+import { Helmet } from "react-helmet";
 
 const bem = cn("About");
 
