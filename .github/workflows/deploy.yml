@@ -4,34 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g., 1 or 1_fix1)"
+        description: "Version to deploy (e.g. 1 or 1_fix1)"
         required: true
         type: string
-
-env:
-  IMAGE: cr.yandex/${{ secrets.REGISTRY_ID }}/app
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Login to YCR
-        uses: docker/login-action@v3
-        with:
-          registry: cr.yandex
-          username: iam
-          password: ${{ secrets.YC_TOKEN }}
-
-      - name: Verify image exists
+      - name: Configure SSH
         run: |
-          IMAGE_TAG="${{ inputs.version }}_latest"
-          if ! docker manifest inspect $IMAGE:$IMAGE_TAG >/dev/null 2>&1; then
-            echo "::error::Image $IMAGE:$IMAGE_TAG not found in registry"
-            exit 1
-          fi
-          echo "Image $IMAGE:$IMAGE_TAG verified"
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
 
-      - name: Deploy via SSH
+      - name: Deploy container
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VM_IP }}
@@ -39,47 +26,53 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script_timeout: 5m
           script: |
-            set -e  # Прерывать при ошибках
-            echo "=== Starting deployment ==="
+            set -ex  # Включить вывод команд и прерывание при ошибках
 
-            # Авторизация и загрузка образа
+            # 1. Авторизация и загрузка образа
             echo "${{ secrets.YC_TOKEN }}" | docker login --username iam --password-stdin cr.yandex
-            docker pull $IMAGE:${{ inputs.version }}_latest
+            docker pull cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
 
-            # Остановка старого контейнера
-            docker stop app || echo "No running container to stop"
-            docker rm app || echo "No container to remove"
+            # 2. Остановка старого контейнера (если есть)
+            if docker ps -a | grep -q app; then
+              docker stop app || true
+              docker rm app || true
+              echo "Старый контейнер удален"
+            else
+              echo "Предыдущий контейнер не найден - пропускаем удаление"
+            fi
 
-            # Запуск нового контейнера
+            # 3. Запуск нового контейнера
             docker run -d \
               --name app \
               --restart unless-stopped \
               -p 80:3000 \
               -e NODE_ENV=production \
-              $IMAGE:${{ inputs.version }}_latest
+              cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ inputs.version }}_latest
 
-            echo "=== Deployment complete ==="
-            docker ps --filter name=app
+            # 4. Проверка запуска
+            sleep 10  # Даем время на запуск
+            docker ps --filter name=app --format "table {{.ID}}\t{{.Names}}\t{{.Status}}"
 
       - name: Verify deployment
         run: |
           ssh -i ~/.ssh/id_ed25519 ${{ secrets.VM_USERNAME }}@${{ secrets.VM_IP }} << 'EOF'
           set -e
-          echo "=== Verification ==="
 
-          # Проверка контейнера
-          if ! docker inspect -f '{{.State.Running}}' app | grep -q true; then
-            echo "::error::Container is not running"
-            docker logs app || true
+          # Проверяем, что контейнер существует и работает
+          if ! docker ps --format '{{.Names}}' | grep -q '^app$'; then
+            echo "::error::Контейнер 'app' не запущен"
+            echo "Список контейнеров:"
+            docker ps -a
             exit 1
           fi
 
-          # Проверка приложения
-          if ! curl -sSf --retry 3 --max-time 10 http://localhost:3000/hw/store >/dev/null; then
-            echo "::error::Application not responding"
-            docker exec app netstat -tuln || true
+          # Проверяем доступность приложения
+          if ! curl -sSf --retry 3 --max-time 10 http://localhost:3000/hw/store; then
+            echo "::error::Приложение не отвечает"
+            echo "Логи контейнера:"
+            docker logs app
             exit 1
           fi
 
-          echo "✅ Verification passed"
+          echo "✅ Проверка пройдена"
           EOF
