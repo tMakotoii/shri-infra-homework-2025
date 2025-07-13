@@ -8,6 +8,8 @@ jobs:
   lint:
     name: Lint Code
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -23,6 +25,8 @@ jobs:
   test:
     name: Run Tests
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,6 +38,3 @@ jobs:
           key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
       - run: npm ci
       - run: npm run test
-
-  strategy:
-    fail-fast: false
