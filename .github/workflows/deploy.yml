@@ -1,0 +1,25 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version"
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH and deploy
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.VM_IP }}
+          username: ${{ secrets.VM_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            docker stop app || true
+            docker rm app || true
+            echo ${{ secrets.YC_TOKEN }} | docker login --username iam --password-stdin cr.yandex
+            docker pull cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ github.event.inputs.version }}_latest
+            docker run -d -p 80:3000 --name app cr.yandex/${{ secrets.REGISTRY_ID }}/app:${{ github.event.inputs.version }}_latest

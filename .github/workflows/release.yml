@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v2
+        with:
+          node-version: "16"
+
+      - name: Run checks
+        run: |
+          npm ci
+          npm run lint
+          npm run test
+
+      - name: Create release branch
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git checkout -b releases/${{ github.run_number }}
+          git push origin releases/${{ github.run_number }}
+
+      - name: Build and push Docker image
+        env:
+          REGISTRY_ID: your-registry-id
+          YC_TOKEN: ${{ secrets.YC_TOKEN }}
+        run: |
+          # Build and push to Yandex Container Registry
+          docker build -t cr.yandex/$REGISTRY_ID/app:${{ github.run_number }} .
+          docker tag cr.yandex/$REGISTRY_ID/app:${{ github.run_number }} cr.yandex/$REGISTRY_ID/app:${{ github.run_number }}_latest
+          echo $YC_TOKEN | docker login --username iam --password-stdin cr.yandex
+          docker push cr.yandex/$REGISTRY_ID/app:${{ github.run_number }}
+          docker push cr.yandex/$REGISTRY_ID/app:${{ github.run_number }}_latest
+
+      - name: Create tag
+        run: |
+          git tag v${{ github.run_number }}
+          git push origin v${{ github.run_number }}
+
+      - name: Update CHANGELOG and create Issue
+        run: |
+          # Add commands to update CHANGELOG.md
+          # Create GitHub issue using gh CLI
